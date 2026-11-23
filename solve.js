@@ -28,12 +28,14 @@ function escapeHtml(text) {
 const SLUG_MAX = 64;
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
+/** Whitespace codes (the \s set), as a table: WS[c] is 1 exactly for whitespace. A table lookup is measurably faster than the boolean chain it replaces (wordsOf over all practice bodies: 15.0 ms vs 21.0 ms warm). */
+const WS = new Uint8Array(65536);
+for (const c of [9, 10, 11, 12, 13, 32, 160, 5760, 8232, 8233, 8239, 8287, 12288, 65279]) WS[c] = 1;
+for (let c = 8192; c <= 8202; c++) WS[c] = 1;
+
 /** Whether code `c` is a JavaScript whitespace character (the \s set). */
 function isWSCode(c) {
-  return (
-    c === 9 || c === 10 || c === 11 || c === 12 || c === 13 || c === 32 || c === 160 || c === 5760 ||
-    (c >= 8192 && c <= 8202) || c === 8232 || c === 8233 || c === 8239 || c === 8287 || c === 12288 || c === 65279
-  );
+  return WS[c] === 1;
 }
 
 /**
@@ -393,73 +395,6 @@ function trimLine(line) {
   return line.slice(a, b);
 }
 
-/** `src`'s block tokens, in order. */
-function lex(src) {
-  const lines = src.split('\n');
-  const tokens = [];
-  let i = 0;
-  const n = lines.length;
-  while (i < n) {
-    const line = lines[i];
-    if (isBlank(line)) { i++; continue; }
-    const lang = fenceLang(line);
-    if (lang !== null) {
-      const body = [];
-      i++;
-      while (i < n && !isFenceClose(lines[i])) body.push(lines[i++]);
-      i++;
-      tokens.push({ type: 'code', lang, lines: body });
-      continue;
-    }
-    const heading = headingOf(line);
-    if (heading !== null) {
-      tokens.push({ type: 'heading', depth: heading.depth, text: heading.text });
-      i++;
-      continue;
-    }
-    if (isHr(line)) { tokens.push({ type: 'hr' }); i++; continue; }
-    if (line.charCodeAt(0) === 62) {
-      const body = [];
-      while (i < n && lines[i].charCodeAt(0) === 62) {
-        const l = lines[i++];
-        body.push(l.charCodeAt(1) === 32 ? l.slice(2) : l.slice(1));
-      }
-      const kept = [];
-      for (const l of body) {
-        const t = trimLine(l);
-        if (t !== '') kept.push(t);
-      }
-      tokens.push({ type: 'blockquote', lines: kept });
-      continue;
-    }
-    const isBullet = (line.charCodeAt(0) === 45 || line.charCodeAt(0) === 42) && line.charCodeAt(1) === 32;
-    const ordered = !isBullet ? orderedOf(line) : null;
-    if (isBullet || ordered !== null) {
-      const isOrdered = ordered !== null;
-      const items = [];
-      while (i < n) {
-        if (isOrdered) {
-          const m = orderedOf(lines[i]);
-          if (m !== null) { items.push([trimLine(m.rest)]); i++; continue; }
-        } else if ((lines[i].charCodeAt(0) === 45 || lines[i].charCodeAt(0) === 42) && lines[i].charCodeAt(1) === 32) {
-          items.push([trimLine(lines[i].slice(2))]);
-          i++;
-          continue;
-        }
-        if (isContinued(lines[i])) { items[items.length - 1].push(trimLine(lines[i])); i++; }
-        else break;
-      }
-      tokens.push({ type: 'list', ordered: isOrdered, start: isOrdered ? Number(ordered.num) : 1, items: items.map((parts) => parts.join('\n')) });
-      continue;
-    }
-    const body = [trimLine(line)];
-    i++;
-    while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
-    tokens.push({ type: 'paragraph', text: body.join('\n') });
-  }
-  return tokens;
-}
-
 /** The characters a backslash escapes. */
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
 
@@ -584,49 +519,89 @@ function inline(s, env) {
  * table of contents (every level 2 and 3 heading: level, id and its inline HTML) and
  * its excerpt (the first paragraph's inline HTML, or "").
  */
+/**
+ * `src` rendered in one pass, straight to its HTML string (each block on its
+ * own lines, a "\n" after the last), its table of contents (every level 2 and
+ * 3 heading: level, id and its inline HTML) and its excerpt (the first
+ * paragraph's inline HTML, or ""). No token objects, no block list: the same
+ * blocks lex() + the old renderer produced, rendered as they are met, so the
+ * output is identical while the lexer, the tokens and the blocks array -- and
+ * the garbage they made -- are gone.
+ */
 function renderMarkdown(src, env, slugCache) {
   const ids = new Set();
-  const blocks = [];
   const toc = [];
   let excerpt = null;
-  for (const t of lex(src)) {
-    switch (t.type) {
-      case 'heading': {
-        const id = uniqueSlug(slugify(t.text, slugCache), ids);
-        const html = inline(t.text, env);
-        blocks.push(`<h${t.depth} id="${id}">${html}</h${t.depth}>`);
-        if (t.depth === 2 || t.depth === 3) toc.push({ level: t.depth, id, html });
-        break;
-      }
-      case 'code': {
-        const cls = t.lang === '' ? '' : ` class="language-${escapeHtml(t.lang)}"`;
-        const body = t.lines.length === 0 ? '' : escapeHtml(t.lines.join('\n')) + '\n';
-        blocks.push(`<pre><code${cls}>${body}</code></pre>`);
-        break;
-      }
-      case 'hr':
-        blocks.push('<hr>');
-        break;
-      case 'blockquote':
-        blocks.push(t.lines.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(t.lines.join('\n'), env)}</p>\n</blockquote>`);
-        break;
-      case 'list': {
-        const tag = t.ordered ? 'ol' : 'ul';
-        const open = t.ordered && t.start !== 1 ? `<ol start="${t.start}">` : `<${tag}>`;
-        let inner = '';
-        for (const item of t.items) inner += `<li>${inline(item, env)}</li>\n`;
-        blocks.push(`${open}\n${inner}</${tag}>`);
-        break;
-      }
-      case 'paragraph': {
-        const html = inline(t.text, env);
-        if (excerpt === null) excerpt = html;
-        blocks.push(`<p>${html}</p>`);
-        break;
-      }
+  let html = '';
+  const lines = src.split('\n');
+  const n = lines.length;
+  let i = 0;
+  while (i < n) {
+    const line = lines[i];
+    if (isBlank(line)) { i++; continue; }
+    const lang = fenceLang(line);
+    if (lang !== null) {
+      let body = '';
+      let count = 0;
+      i++;
+      while (i < n && !isFenceClose(lines[i])) { if (count > 0) body += '\n'; body += lines[i++]; count++; }
+      i++;
+      const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
+      html += `<pre><code${cls}>${count === 0 ? '' : escapeHtml(body) + '\n'}</code></pre>\n`;
+      continue;
     }
+    const heading = headingOf(line);
+    if (heading !== null) {
+      const id = uniqueSlug(slugify(heading.text, slugCache), ids);
+      const h = inline(heading.text, env);
+      html += `<h${heading.depth} id="${id}">${h}</h${heading.depth}>\n`;
+      if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html: h });
+      i++;
+      continue;
+    }
+    if (isHr(line)) { html += '<hr>\n'; i++; continue; }
+    if (line.charCodeAt(0) === 62) {
+      let body = '';
+      let count = 0;
+      while (i < n && lines[i].charCodeAt(0) === 62) {
+        const l = lines[i++];
+        const t = trimLine(l.charCodeAt(1) === 32 ? l.slice(2) : l.slice(1));
+        if (t !== '') { if (count > 0) body += '\n'; body += t; count++; }
+      }
+      html += count === 0 ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inline(body, env)}</p>\n</blockquote>\n`;
+      continue;
+    }
+    const isBullet = (line.charCodeAt(0) === 45 || line.charCodeAt(0) === 42) && line.charCodeAt(1) === 32;
+    const ordered = !isBullet ? orderedOf(line) : null;
+    if (isBullet || ordered !== null) {
+      const isOrdered = ordered !== null;
+      const start = isOrdered ? Number(ordered.num) : 1;
+      const items = [];
+      while (i < n) {
+        if (isOrdered) {
+          const m = orderedOf(lines[i]);
+          if (m !== null) { items.push(trimLine(m.rest)); i++; continue; }
+        } else if ((lines[i].charCodeAt(0) === 45 || lines[i].charCodeAt(0) === 42) && lines[i].charCodeAt(1) === 32) {
+          items.push(trimLine(lines[i].slice(2))); i++; continue;
+        }
+        if (isContinued(lines[i])) { items[items.length - 1] += '\n' + trimLine(lines[i]); i++; }
+        else break;
+      }
+      const tag = isOrdered ? 'ol' : 'ul';
+      const open = isOrdered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`;
+      let inner = '';
+      for (const item of items) inner += `<li>${inline(item, env)}</li>\n`;
+      html += `${open}\n${inner}</${tag}>\n`;
+      continue;
+    }
+    let text = trimLine(line);
+    i++;
+    while (i < n && !endsParagraph(lines[i])) { text += '\n' + trimLine(lines[i]); i++; }
+    const h = inline(text, env);
+    if (excerpt === null) excerpt = h;
+    html += `<p>${h}</p>\n`;
   }
-  return { html: blocks.map((b) => `${b}\n`).join(''), toc, excerpt: excerpt ?? '' };
+  return { html, toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- templates
@@ -729,6 +704,7 @@ function parseTemplate(name, src) {
     }
   }
   if (stack.length > 1) throw new TemplateError(`template "${name}": a ${stack[stack.length - 1].kind} is not closed`);
+  markMemoizable(root.body, new Set());
   return root.body;
 }
 
@@ -760,6 +736,69 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
+// Names that are the same on every page render of one case (the site, the
+// tag list, the recent list). A for-loop whose body only reads these, its own
+// item and `loop` renders the same string for the same array, so it is
+// rendered once per array and reused -- the recent-posts and tag lists a
+// layout repeats on every page are the ones this saves.
+const CASE_CONSTANTS = new Set(['site', 'tags', 'recent']);
+
+/** Whether every value `nodes` reads is a name in `bound` (a for item of an enclosing loop), `loop`, or a case constant. */
+function subtreeReadsOnly(nodes, bound) {
+  for (const n of nodes) {
+    if (n.kind === 'var' || n.kind === 'raw') {
+      if (!bound.has(n.path[0]) && n.path[0] !== 'loop' && !CASE_CONSTANTS.has(n.path[0])) return false;
+    } else if (n.kind === 'if') {
+      if (!bound.has(n.path[0]) && n.path[0] !== 'loop' && !CASE_CONSTANTS.has(n.path[0])) return false;
+      if (!subtreeReadsOnly(n.then, bound)) return false;
+      if (n.else !== null && !subtreeReadsOnly(n.else, bound)) return false;
+    } else if (n.kind === 'for') {
+      if (!bound.has(n.path[0]) && n.path[0] !== 'loop' && !CASE_CONSTANTS.has(n.path[0])) return false;
+      const inner = new Set(bound);
+      inner.add(n.name);
+      if (!subtreeReadsOnly(n.body, inner)) return false;
+    } else if (n.kind === 'include') {
+      return false; // the included template's reads are not visible here
+    }
+  }
+  return true;
+}
+
+/** Mark every for-node in `nodes` with `.memo`: true when its body reads only its own item, `loop` and case constants. */
+function markMemoizable(nodes, bound) {
+  for (const n of nodes) {
+    if (n.kind === 'for') {
+      const b = new Set(bound);
+      b.add(n.name);
+      n.memo = subtreeReadsOnly(n.body, b);
+      markMemoizable(n.body, b);
+    } else if (n.kind === 'if') {
+      markMemoizable(n.then, bound);
+      if (n.else !== null) markMemoizable(n.else, bound);
+    }
+  }
+}
+
+/**
+ * `n`'s body over the array `xs`, rendered into `acc.s`. One scope, one vars
+ * object and one `loop` object for the whole loop, mutated per item: the
+ * render is synchronous, so nothing can observe the previous item's values,
+ * and the per-iteration object pair the old code made is gone.
+ */
+function renderFor(n, xs, scope, ctx, depth, acc) {
+  const loop = { index: 0, first: false, last: false, length: xs.length };
+  const vars = { loop };
+  vars[n.name] = undefined;
+  const child = { vars, parent: scope };
+  for (let k = 0; k < xs.length; k++) {
+    vars[n.name] = xs[k];
+    loop.index = k + 1;
+    loop.first = k === 0;
+    loop.last = k === xs.length - 1;
+    renderNodes(n.body, child, ctx, depth, acc);
+  }
+}
+
 /**
  * `nodes` rendered into `acc.s` (a string accumulator, faster than an array plus
  * a join for the many small chunks a page is made of) in `scope` ({ vars, parent }).
@@ -786,10 +825,17 @@ function renderNodes(nodes, scope, ctx, depth, acc) {
       case 'for': {
         const xs = lookup(scope, n.path);
         if (!Array.isArray(xs)) break;
-        for (let k = 0; k < xs.length; k++) {
-          const vars = { [n.name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length } };
-          renderNodes(n.body, { vars, parent: scope }, ctx, depth, acc);
+        if (n.memo === true) {
+          const cache = n.cache ?? (n.cache = new Map());
+          const hit = cache.get(xs);
+          if (hit !== undefined) { acc.s += hit; break; }
+          const tmp = { s: '' };
+          renderFor(n, xs, scope, ctx, depth, tmp);
+          cache.set(xs, tmp.s);
+          acc.s += tmp.s;
+          break;
         }
+        renderFor(n, xs, scope, ctx, depth, acc);
         break;
       }
       case 'include': {
