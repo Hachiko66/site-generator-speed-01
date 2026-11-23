@@ -61,6 +61,43 @@ this entry. The hot paths are rewritten, the rules are not:
 - **No per-case state.** Every cache is created inside one `run` call and
   dropped with it.
 
+v2 (this version) keeps every rule above and attacks the end-to-end number,
+which v1's 4.11× `run()` win did not move nearly as much as it should have —
+the driver, not `run()`, was the bottleneck:
+
+- **Markdown in one fused pass.** The lexer and the renderer are one
+  function that renders each block straight into the output string as it is
+  met: no token objects, no block list, no second pass over the tokens. The
+  output is identical (verified by the 204-input differential suite below);
+  the garbage the tokens made — about 18% of `run()`'s cold CPU was the
+  collector — is gone, and cold `run()` fell from ~605–690 ms to ~484–540 ms.
+- **Template loops reuse one scope.** A `for` node renders all its items
+  through a single scope, vars and `loop` object, mutated per item, instead of
+  a fresh pair of objects per iteration.
+- **Invariant fragments rendered once.** A `for` loop whose body reads only
+  its own item, `loop`, and the per-case constants (`site`, `tags`, `recent`)
+  renders the same string for the same array, so it is rendered once per array
+  and reused: the recent-posts and tag lists a layout repeats on every page.
+  The memo lives on the parsed node and dies with the case; nothing is cached
+  from one case to the next.
+- **Whitespace as a table.** `isWSCode` is a `Uint8Array` lookup instead of a
+  boolean chain (word counting over all practice bodies: 15.0 ms vs 21.0 ms
+  warm), which also speeds the word skipping the front-matter scanner does.
+- **The driver streams its output.** `main.ts` stringifies and writes each
+  case's answer as it is produced, instead of holding the whole answers array
+  and stringifying 7.4 MB at once. The bytes written are identical to
+  `JSON.stringify(answers)`; the peak live set stays one case, so the
+  collector has far less to do (fresh-process practice set: ~947 ms vs
+  ~1112 ms for the hold-everything driver).
+- **A larger young generation.** `main.ts` also sets
+  `--max-semi-space-size=64`: the build allocates many short-lived objects
+  and fewer scavenges are measurably faster (~961 ms vs ~990 ms).
+
+Two ideas were measured and **dropped**: a hand-rolled JSON writer for the
+answers (byte-identical but slower than native `JSON.stringify`, 172 ms vs
+96 ms warm) and a regex word counter (39 ms vs 29 ms warm). Only what moves
+the end-to-end number stayed.
+
 ## Differential-test evidence
 
 Every comparison is against makefun-site 1.0.0 itself (the kit's house
@@ -96,21 +133,37 @@ value ending on an escaped quote (`title: "a\"`) is refused by the reference
 ## Benchmark
 
 Measured on this machine (Node v24.22.1) on the kit's practice set (3 cases,
-257–486 files each). CPU time by `process.cpuUsage`, 9 runs each:
+257–486 files each). End to end through the `main.ts` driver in a fresh
+process per run — Node startup, reading and parsing the 2.9 MB `cases.json`,
+`run()` on all 3 cases, stringifying and writing the 7.4 MB `answers.json` —
+CPU time by `resource.getrusage` on the child process, 7 runs each:
 
-| | avg | min | max |
-| --- | --- | --- | --- |
-| makefun-site 1.0.0 (house baseline), `run()` only | 665.6 ms | 635.4 ms | 721.7 ms |
-| this entry, `run()` only | 161.8 ms | 144.6 ms | 219.1 ms |
+| | avg | median | min | max |
+| --- | --- | --- | --- | --- |
+| makefun-site 1.0.0 (house baseline) | 1730 ms | 1724 ms | 1620 ms | 1828 ms |
+| this entry v1 | 1202 ms | 1204 ms | 1167 ms | 1256 ms |
+| **this entry v2** | **980 ms** | **975 ms** | **941 ms** | **1059 ms** |
 
-**4.11× faster on the work itself** (75.7% less CPU). End to end through the
-`main.ts` driver in a fresh process per run — which also pays Node startup,
-parsing the 2.9 MB `cases.json` and stringifying the 7.4 MB `answers.json`,
-costs the do-nothing control nets out — the entry measures ~1.01–1.38 s of
-CPU against the baseline's ~1.49–1.67 s (control ~0.29 s), so the official
-net figure is roughly 1.4–1.8×; the fixed JSON cost dilutes the ratio, the
-`run()` work underneath is the 4.11× above. Either way the entry is clearly
-faster than the baseline on every run measured.
+**v2 is 1.77× faster than the baseline end to end, and 18% faster than v1**
+(1202 ms → 980 ms). The `run()` work underneath is faster too: warm,
+in-process, median of 7 runs over the same 3 cases, v1 257 ms vs v2 188 ms.
+Cold, `run()` alone fell from ~605–690 ms (v1) to ~484–540 ms (v2); the
+streaming driver and the larger young generation account for the rest of the
+end-to-end gain.
+
+Honest note: this closes part of the gap, not all of it. v1's dev result was
+rank #4,593 of 6,189, with the entry just ahead at 1,700,000 cpu_us and the
+10th-place reward line at 190,000 cpu_us. v2's ~18% end-to-end gain moves the
+rank up, but the reward line is still roughly 5× below v2's local number, and
+the server's scale runs higher than this machine's. The remaining gap is
+dominated by fixed costs no pure-JavaScript entry can remove — Node startup,
+parsing the multi-megabyte input and stringifying the multi-megabyte output —
+and by `run()` itself, whose cold cost is mostly JIT warm-up and collection.
+The entries at the reward line advertise native/WASM engines in their titles,
+which the competition's own requirements forbid ("no WebAssembly, native
+addon or prebuilt binary"); whether those entries are disqualified in the
+final is what decides whether a legal pure-JavaScript entry can reach the top
+10 at all.
 
 ## Files
 
