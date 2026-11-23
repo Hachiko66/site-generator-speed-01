@@ -1,16 +1,249 @@
-// solve.js — a fast drop-in for makefun-site 1.0.0 (site-generator-speed-01).
+// solve.js — v3, a byte-native drop-in for makefun-site 1.0.0 (site-generator-speed-01).
 // Written from scratch for this bounty: same answers as makefun-site 1.0.0 for every
 // input, faster. The reference is the vendor code in the kit; this file re-implements
-// its rules (README.md of makefun-site 1.0.0) with the hot paths rewritten: a
-// single-pass inline scanner, a no-allocation HTML escape fast path, memoized slugs,
-// and no split/join round trips in front matter.
+// its rules (README.md of makefun-site 1.0.0) with the hot paths rewritten.
 //
-// run(input) returns the output tree: { path: text, ... } for one site's input
-// { site: { title, base_url, per_page, recent }, templates: { name: source },
-//   files: [{ path, content }] }.
+// v3's principle: never build a big string or a big object graph. All rendering
+// writes bytes into one arena per case, and the answer JSON is emitted directly
+// as bytes — no JSON.stringify over a 7.4 MB object, no 7.4 MB output tree.
+// run(input) returns a Uint8Array holding the JSON bytes of the answer object
+// for one site's input { site, templates, files }. The driver writes those
+// bytes into /output/answers.json between "[" and "]" (the scorer reads the
+// file as JSON values, so key order does not matter, though v3 keeps v2's
+// construction order anyway).
+//
+// What is byte-native: the Markdown renderer (line-offset scanning, no
+// split('\n'); inline rendering straight into the arena), the template engine
+// (templates compiled once per case to flat bytecode, executed by a small VM
+// that writes into the answer arena), and the answer emission (JSON escaping
+// applied inline while copying bytes). What stays string-based, deliberately:
+// JSON.parse of the input (native V8, fastest), String.normalize for NFKD
+// (non-ASCII slugs only), date formatting, String(n), sorting, and the small
+// report lines. Front matter keeps v2's line-offset scanner.
+//
+// No network, no model calls, no WebAssembly, no native addons: pure
+// JavaScript, deterministic. Nothing is cached from one case to the next.
 
 export function run(input) {
   return build(input);
+}
+
+// ---------------------------------------------------------------- the arena
+
+/** A byte range: `s` is an offset into an arena, `l` its length in bytes. */
+class Range {
+  constructor(s, l) { this.s = s; this.l = l; }
+}
+
+/** A growable byte buffer: `b` is the storage, `n` the length used. */
+class Buf {
+  constructor(cap) { this.b = new Uint8Array(cap); this.n = 0; }
+  // The slow path of ensure: double capacity until `need` fits. The fast
+  // path (capacity suffices, the overwhelmingly common case) is inlined at
+  // each call site as `if (out.n + need > out.b.length) out.grow(need)`, so
+  // a write costs a comparison, not a method call.
+  grow(need) {
+    let cap = this.b.length * 2;
+    while (this.n + need > cap) cap *= 2;
+    const nb = new Uint8Array(cap);
+    nb.set(this.b.subarray(0, this.n));
+    this.b = nb;
+  }
+}
+
+/** One byte. */
+function writeByte(out, c) {
+  if (out.n + 1 > out.b.length) out.grow(1);
+  out.b[out.n++] = c;
+}
+
+/** An ASCII string's bytes (the caller guarantees every char is < 128). */
+function writeAscii(out, str) {
+  const len = str.length;
+  if (out.n + len > out.b.length) out.grow(len);
+  const b = out.b;
+  let n = out.n;
+  for (let i = 0; i < len; i++) b[n++] = str.charCodeAt(i);
+  out.n = n;
+}
+
+/**
+ * `str[a..b)` as UTF-8 bytes, no escaping. Long runs go through Buffer.from
+ * (C++ encode, ~12x the per-char loop); short runs keep the per-char loop,
+ * which is cheaper than an allocation for a handful of chars.
+ */
+function writeStrRange(out, str, a, b) {
+  const len = b - a;
+  if (len <= 0) return;
+  if (len > 16) {
+    const rest = Buffer.from(str.slice(a, b), 'utf8');
+    if (out.n + rest.length > out.b.length) out.grow(rest.length);
+    out.b.set(rest, out.n);
+    out.n += rest.length;
+    return;
+  }
+  if (out.n + len > out.b.length) out.grow(len);
+  let n = out.n;
+  const buf = out.b;
+  let i = a;
+  while (i < b) {
+    const c = str.charCodeAt(i);
+    if (c >= 128) break;
+    buf[n++] = c;
+    i++;
+  }
+  out.n = n;
+  if (i < b) {
+    const rest = Buffer.from(str.slice(i, b), 'utf8');
+    if (out.n + rest.length > out.b.length) out.grow(rest.length);
+    out.b.set(rest, out.n);
+    out.n += rest.length;
+  }
+}
+
+/** `src[s..e)` copied as-is. Safe when src is out's own buffer (the range ends before the cursor). */
+function writeBytes(out, src, s, e) {
+  const len = e - s;
+  if (len <= 0) return;
+  if (out.n + len > out.b.length) out.grow(len);
+  out.b.set(src.subarray(s, e), out.n);
+  out.n += len;
+}
+
+const HEX = '0123456789abcdef';
+
+/** The \u00XX escape for a control char `c` (not one of \b \f \n \r \t). */
+function writeUnicodeEscape(out, c) {
+  if (out.n + 6 > out.b.length) out.grow(6);
+  const b = out.b;
+  let n = out.n;
+  b[n++] = 92; // \
+  b[n++] = 117; // u
+  b[n++] = 48; // 0
+  b[n++] = 48; // 0
+  b[n++] = HEX.charCodeAt(c >> 4);
+  b[n++] = HEX.charCodeAt(c & 15);
+  out.n = n;
+}
+
+/**
+ * `src[s..e)` (UTF-8 bytes) copied with JSON string escaping: " and \ escaped,
+ * control chars as \b \f \n \r \t or \u00XX. Bytes >= 0x80 pass through: UTF-8
+ * continuation and lead bytes are never a JSON special. Identical to what
+ * JSON.stringify does to the same string.
+ */
+function copyJsonEscaped(out, src, s, e) {
+  let i = s;
+  while (i < e) {
+    let j = i;
+    while (j < e) {
+      const c = src[j];
+      if (c === 34 || c === 92 || c < 32) break;
+      j++;
+    }
+    if (j > i) writeBytes(out, src, i, j);
+    if (j >= e) break;
+    const c = src[j];
+    if (c === 34) writeAscii(out, '\\"');
+    else if (c === 92) writeAscii(out, '\\\\');
+    else if (c === 8) writeAscii(out, '\\b');
+    else if (c === 9) writeAscii(out, '\\t');
+    else if (c === 10) writeAscii(out, '\\n');
+    else if (c === 12) writeAscii(out, '\\f');
+    else if (c === 13) writeAscii(out, '\\r');
+    else writeUnicodeEscape(out, c);
+    i = j + 1;
+  }
+}
+
+/**
+ * `src[s..e)` (UTF-8 bytes) copied with HTML escaping and then JSON escaping
+ * in one pass: & < > " ' become entities (HTML escaping first, as the
+ * reference does), \ and control chars become JSON escapes. This is exactly
+ * escapeHtml followed by JSON.stringify, for a byte range. One pass, no
+ * allocation: cheaper than decode + escapeHtml + JSON.stringify + encode
+ * (measured: the C++ round-trip cost ~13% of run(), this scan ~5.5%).
+ */
+function copyHtmlJsonEscaped(out, src, s, e) {
+  let i = s;
+  while (i < e) {
+    let j = i;
+    while (j < e) {
+      const c = src[j];
+      if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39 || c === 92 || c < 32) break;
+      j++;
+    }
+    if (j > i) writeBytes(out, src, i, j);
+    if (j >= e) break;
+    const c = src[j];
+    if (c === 38) writeAscii(out, '&amp;');
+    else if (c === 60) writeAscii(out, '&lt;');
+    else if (c === 62) writeAscii(out, '&gt;');
+    else if (c === 34) writeAscii(out, '&quot;');
+    else if (c === 39) writeAscii(out, '&#39;');
+    else if (c === 92) writeAscii(out, '\\\\');
+    else if (c === 8) writeAscii(out, '\\b');
+    else if (c === 9) writeAscii(out, '\\t');
+    else if (c === 10) writeAscii(out, '\\n');
+    else if (c === 12) writeAscii(out, '\\f');
+    else if (c === 13) writeAscii(out, '\\r');
+    else writeUnicodeEscape(out, c);
+    i = j + 1;
+  }
+}
+
+/** `str[a..b)` HTML-escaped into the arena (raw bytes, no JSON escaping). */
+function writeHtmlEscapedStrRange(out, str, a, b) {
+  let i = a;
+  while (i < b) {
+    let j = i;
+    while (j < b) {
+      const c = str.charCodeAt(j);
+      if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39) break;
+      j++;
+    }
+    if (j > i) writeStrRange(out, str, i, j);
+    if (j >= b) break;
+    const c = str.charCodeAt(j);
+    if (c === 38) writeAscii(out, '&amp;');
+    else if (c === 60) writeAscii(out, '&lt;');
+    else if (c === 62) writeAscii(out, '&gt;');
+    else if (c === 34) writeAscii(out, '&quot;');
+    else writeAscii(out, '&#39;');
+    i = j + 1;
+  }
+}
+
+/**
+ * A whole string, JSON-escaped, into the answer arena. Long strings go
+ * through JSON.stringify (C++, the reference escaper, ~2.5x the per-byte
+ * scan); short ones keep the one-pass ASCII loop. Identical bytes either
+ * way, and identical to what JSON.stringify does to the same string.
+ */
+function writeJsonStr(out, str) {
+  const len = str.length;
+  if (len > 24) {
+    const j = JSON.stringify(str);
+    const buf = Buffer.from(j.slice(1, -1), 'utf8');
+    if (out.n + buf.length > out.b.length) out.grow(buf.length);
+    out.b.set(buf, out.n);
+    out.n += buf.length;
+    return;
+  }
+  if (out.n + len > out.b.length) out.grow(len);
+  let n = out.n;
+  const buf = out.b;
+  let i = 0;
+  while (i < len) {
+    const c = str.charCodeAt(i);
+    if (c >= 128 || c === 34 || c === 92 || c < 32) break;
+    buf[n++] = c;
+    i++;
+  }
+  out.n = n;
+  if (i === len) return;
+  const rest = Buffer.from(str.slice(i), 'utf8');
+  copyJsonEscaped(out, rest, 0, rest.length);
 }
 
 // ---------------------------------------------------------------- text
@@ -28,7 +261,7 @@ function escapeHtml(text) {
 const SLUG_MAX = 64;
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
-/** Whitespace codes (the \s set), as a table: WS[c] is 1 exactly for whitespace. A table lookup is measurably faster than the boolean chain it replaces (wordsOf over all practice bodies: 15.0 ms vs 21.0 ms warm). */
+/** Whitespace codes (the \s set), as a table: WS[c] is 1 exactly for whitespace. */
 const WS = new Uint8Array(65536);
 for (const c of [9, 10, 11, 12, 13, 32, 160, 5760, 8232, 8233, 8239, 8287, 12288, 65279]) WS[c] = 1;
 for (let c = 8192; c <= 8202; c++) WS[c] = 1;
@@ -43,7 +276,8 @@ function isWSCode(c) {
  * lowered, every run of other characters one "-", none at either end, at most 64
  * characters (a "-" left at the cut dropped), "untitled" when nothing is left.
  * `cache` is a per-build memo (same string, same slug); ASCII text skips the
- * normalize step, which is the identity on it.
+ * normalize step, which is the identity on it. Kept string-based: slugs are
+ * few per case, each computed once, and the ASCII fast path is already there.
  */
 function slugify(text, cache) {
   const hit = cache.get(text);
@@ -301,107 +535,112 @@ function parseFrontMatter(text) {
 
 // ---------------------------------------------------------------- markdown
 
-/** Whether `line` is blank (spaces and tabs only). */
-function isBlank(line) {
-  for (let i = 0; i < line.length; i++) {
-    const c = line.charCodeAt(i);
+// Line helpers over a range (s, e) of a string. Same rules as v2's per-line
+// functions, but on ranges so no line is ever sliced out of the body.
+
+/** Whether the range is blank (spaces and tabs only). */
+function isBlankRange(src, s, e) {
+  for (let i = s; i < e; i++) {
+    const c = src.charCodeAt(i);
     if (c !== 32 && c !== 9) return false;
   }
   return true;
 }
 
-/** A fence's language, or null when `line` does not open one. */
-function fenceLang(line) {
-  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return null;
-  let i = 3;
-  while (i < line.length) {
-    const c = line.charCodeAt(i);
+/** A fence's language, or null when the range does not open one. */
+function fenceLangRange(src, s, e) {
+  if (e - s < 3 || src.charCodeAt(s) !== 96 || src.charCodeAt(s + 1) !== 96 || src.charCodeAt(s + 2) !== 96) return null;
+  let i = s + 3;
+  while (i < e) {
+    const c = src.charCodeAt(i);
     if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45) i++;
     else break;
   }
-  const lang = line.slice(3, i);
-  while (i < line.length) {
-    const c = line.charCodeAt(i);
+  const lang = src.slice(s + 3, i);
+  while (i < e) {
+    const c = src.charCodeAt(i);
     if (c !== 32 && c !== 9) return null;
     i++;
   }
   return lang;
 }
 
-/** Whether `line` closes a fence (``` then spaces or tabs only). */
-function isFenceClose(line) {
-  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return false;
-  for (let i = 3; i < line.length; i++) {
-    const c = line.charCodeAt(i);
+/** Whether the range closes a fence (``` then spaces or tabs only). */
+function isFenceCloseRange(src, s, e) {
+  if (e - s < 3 || src.charCodeAt(s) !== 96 || src.charCodeAt(s + 1) !== 96 || src.charCodeAt(s + 2) !== 96) return false;
+  for (let i = s + 3; i < e; i++) {
+    const c = src.charCodeAt(i);
     if (c !== 32 && c !== 9) return false;
   }
   return true;
 }
 
-/** A heading line's level and text, or null (a heading's text is never empty). */
-function headingOf(line) {
+/** A heading range's level and text range, or null (a heading's text is never empty). */
+function headingOfRange(src, s, e) {
   let n = 0;
-  while (n < line.length && line.charCodeAt(n) === 35) n++;
+  while (s + n < e && src.charCodeAt(s + n) === 35) n++;
   if (n === 0 || n > 6) return null;
-  let i = n;
-  if (i >= line.length || (line.charCodeAt(i) !== 32 && line.charCodeAt(i) !== 9)) return null;
-  while (i < line.length && (line.charCodeAt(i) === 32 || line.charCodeAt(i) === 9)) i++;
-  let end = line.length;
-  while (end > i && (line.charCodeAt(end - 1) === 32 || line.charCodeAt(end - 1) === 9)) end--;
+  let i = s + n;
+  if (i >= e || (src.charCodeAt(i) !== 32 && src.charCodeAt(i) !== 9)) return null;
+  while (i < e && (src.charCodeAt(i) === 32 || src.charCodeAt(i) === 9)) i++;
+  let end = e;
+  while (end > i && (src.charCodeAt(end - 1) === 32 || src.charCodeAt(end - 1) === 9)) end--;
   if (end === i) return null;
-  return { depth: n, text: line.slice(i, end) };
+  return { depth: n, a: i, b: end };
 }
 
-/** Whether `line` is a thematic break (--- or *** then spaces or tabs only). */
-function isHr(line) {
-  const c0 = line.charCodeAt(0);
+/** Whether the range is a thematic break (--- or *** then spaces or tabs only). */
+function isHrRange(src, s, e) {
+  if (e - s < 3) return false;
+  const c0 = src.charCodeAt(s);
   if (c0 !== 45 && c0 !== 42) return false;
-  if (line.charCodeAt(1) !== c0 || line.charCodeAt(2) !== c0) return false;
-  for (let i = 3; i < line.length; i++) {
-    const c = line.charCodeAt(i);
+  if (src.charCodeAt(s + 1) !== c0 || src.charCodeAt(s + 2) !== c0) return false;
+  for (let i = s + 3; i < e; i++) {
+    const c = src.charCodeAt(i);
     if (c !== 32 && c !== 9) return false;
   }
   return true;
 }
 
-/** An ordered-list marker's number and rest, or null. */
-function orderedOf(line) {
-  let i = 0;
-  while (i < line.length && i < 9 && line.charCodeAt(i) >= 48 && line.charCodeAt(i) <= 57) i++;
-  if (i === 0) return null;
-  if (line.charCodeAt(i) !== 46 || line.charCodeAt(i + 1) !== 32) return null;
-  return { num: line.slice(0, i), rest: line.slice(i + 2) };
+/** An ordered-list marker's number and rest start, or null. */
+function orderedOfRange(src, s, e) {
+  let i = s;
+  while (i < e && i - s < 9 && src.charCodeAt(i) >= 48 && src.charCodeAt(i) <= 57) i++;
+  if (i === s) return null;
+  if (i >= e || src.charCodeAt(i) !== 46) return null;
+  if (i + 1 >= e || src.charCodeAt(i + 1) !== 32) return null;
+  return { num: src.slice(s, i), rest: i + 2 };
 }
 
-/** Whether `line` continues a list item (two or more spaces, then a non-space). */
-function isContinued(line) {
-  let i = 0;
-  while (i < line.length && line.charCodeAt(i) === 32) i++;
-  if (i < 2 || i >= line.length) return false;
-  return !isWSCode(line.charCodeAt(i));
+/** Whether the range continues a list item (two or more spaces, then a non-space). */
+function isContinuedRange(src, s, e) {
+  let i = s;
+  while (i < e && src.charCodeAt(i) === 32) i++;
+  if (i - s < 2 || i >= e) return false;
+  return !isWSCode(src.charCodeAt(i));
 }
 
-/** Whether `line` ends a paragraph: blank, a fence, a heading or a thematic break. */
-function endsParagraph(line) {
-  return isBlank(line) || fenceLang(line) !== null || headingOf(line) !== null || isHr(line);
+/** Whether the range ends a paragraph: blank, a fence, a heading or a thematic break. */
+function endsParagraphRange(src, s, e) {
+  return isBlankRange(src, s, e) || fenceLangRange(src, s, e) !== null || headingOfRange(src, s, e) !== null || isHrRange(src, s, e);
 }
 
-/** A paragraph/list line as rendered: spaces and tabs at either end dropped. */
-function trimLine(line) {
-  let a = 0;
-  let b = line.length;
-  while (a < b && (line.charCodeAt(a) === 32 || line.charCodeAt(a) === 9)) a++;
-  while (b > a && (line.charCodeAt(b - 1) === 32 || line.charCodeAt(b - 1) === 9)) b--;
-  return line.slice(a, b);
+/** A range with spaces and tabs at either end dropped, as [a, b]. */
+function trimRange(src, s, e) {
+  let a = s;
+  let b = e;
+  while (a < b && (src.charCodeAt(a) === 32 || src.charCodeAt(a) === 9)) a++;
+  while (b > a && (src.charCodeAt(b - 1) === 32 || src.charCodeAt(b - 1) === 9)) b--;
+  return [a, b];
 }
 
 /** The characters a backslash escapes. */
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
 
-/** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
-function findUnescaped(s, what, from) {
-  for (let j = from; j <= s.length - what.length; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
+/** The first index from `from` (bounded by `end`) where `s` holds `what` outside a backslash escape, or -1. */
+function findUnescapedRange(s, what, from, end) {
+  for (let j = from; j <= end - what.length; j++) {
+    if (s[j] === '\\' && j + 1 < end && ESCAPABLE.has(s[j + 1])) {
       j++;
       continue;
     }
@@ -410,16 +649,16 @@ function findUnescaped(s, what, from) {
   return -1;
 }
 
-/** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
-function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
+/** The first single * from `from` (one whose run is not **), outside an escape, bounded by `end`, or -1. */
+function findSingleStarRange(s, from, end) {
+  for (let j = from; j < end; j++) {
     const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
+    if (c === '\\' && j + 1 < end && ESCAPABLE.has(s[j + 1])) {
       j++;
       continue;
     }
     if (c !== '*') continue;
-    if (s[j + 1] === '*') {
+    if (j + 1 < end && s[j + 1] === '*') {
       j++;
       continue;
     }
@@ -429,24 +668,26 @@ function findSingleStar(s, from) {
 }
 
 /**
- * `s` rendered inline; `env.link(target)` is a link's href. One native scan for the
- * next interesting character; plain runs between specials are copied as-is (they
- * hold no character that needs escaping), so no per-character escape calls.
- * The scanner regex is fresh per call: inline() recurses, and a shared regex
- * would lose its place across the recursion.
+ * `s[start..end)` rendered inline, straight into the arena (HTML-escaped).
+ * One native scan for the next interesting character; plain runs between
+ * specials are copied as-is (they hold no character that needs escaping), so
+ * no per-character escape calls. The scanner regex is fresh per call: inline
+ * recurses on ranges, and a shared regex would lose its place. Same rules as
+ * v2's inline(), only the output goes to bytes instead of a string.
  */
-function inline(s, env) {
-  let out = '';
+function inlineRange(s, start, end, env, out) {
   const re = /[\\`*\[&<>"']/g;
-  let plain = 0;
+  re.lastIndex = start;
+  let plain = start;
   let m;
   while ((m = re.exec(s)) !== null) {
     const j = m.index;
+    if (j >= end) break;
     const c = s[j];
     if (c === '\\') {
-      if (j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
-        if (plain < j) out += s.slice(plain, j);
-        out += s[j + 1]; // an escapable character is never an HTML special
+      if (j + 1 < end && ESCAPABLE.has(s[j + 1])) {
+        if (plain < j) writeStrRange(out, s, plain, j);
+        writeByte(out, s.charCodeAt(j + 1)); // an escapable character is never an HTML special
         plain = j + 2;
         re.lastIndex = plain;
       } else {
@@ -456,9 +697,11 @@ function inline(s, env) {
     }
     if (c === '`') {
       const k = s.indexOf('`', j + 1);
-      if (k > j + 1) {
-        if (plain < j) out += s.slice(plain, j);
-        out += '<code>' + escapeHtml(s.slice(j + 1, k)) + '</code>';
+      if (k !== -1 && k < end && k > j + 1) {
+        if (plain < j) writeStrRange(out, s, plain, j);
+        writeAscii(out, '<code>');
+        writeHtmlEscapedStrRange(out, s, j + 1, k);
+        writeAscii(out, '</code>');
         plain = k + 1;
         re.lastIndex = plain;
       } else {
@@ -467,21 +710,25 @@ function inline(s, env) {
       continue;
     }
     if (c === '*') {
-      if (s[j + 1] === '*') {
-        const k = findUnescaped(s, '**', j + 2);
+      if (j + 1 < end && s[j + 1] === '*') {
+        const k = findUnescapedRange(s, '**', j + 2, end);
         if (k > j + 2) {
-          if (plain < j) out += s.slice(plain, j);
-          out += '<strong>' + inline(s.slice(j + 2, k), env) + '</strong>';
+          if (plain < j) writeStrRange(out, s, plain, j);
+          writeAscii(out, '<strong>');
+          inlineRange(s, j + 2, k, env, out);
+          writeAscii(out, '</strong>');
           plain = k + 2;
           re.lastIndex = plain;
         } else {
           re.lastIndex = j + 2;
         }
       } else {
-        const k = findSingleStar(s, j + 1);
+        const k = findSingleStarRange(s, j + 1, end);
         if (k > j + 1) {
-          if (plain < j) out += s.slice(plain, j);
-          out += '<em>' + inline(s.slice(j + 1, k), env) + '</em>';
+          if (plain < j) writeStrRange(out, s, plain, j);
+          writeAscii(out, '<em>');
+          inlineRange(s, j + 1, k, env, out);
+          writeAscii(out, '</em>');
           plain = k + 1;
           re.lastIndex = plain;
         } else {
@@ -491,12 +738,17 @@ function inline(s, env) {
       continue;
     }
     if (c === '[') {
-      const k = findUnescaped(s, ']', j + 1);
-      const mm = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
-      const target = mm === -1 ? '' : s.slice(k + 2, mm);
+      const k = findUnescapedRange(s, ']', j + 1, end);
+      const mm = k !== -1 && k + 1 < end && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
+      const target = mm === -1 || mm >= end ? '' : s.slice(k + 2, mm);
       if (target !== '' && !/\s/.test(target)) {
-        if (plain < j) out += s.slice(plain, j);
-        out += '<a href="' + escapeHtml(env.link(target)) + '">' + inline(s.slice(j + 1, k), env) + '</a>';
+        if (plain < j) writeStrRange(out, s, plain, j);
+        const href = escapeHtml(env.link(target));
+        writeAscii(out, '<a href="');
+        writeStrRange(out, href, 0, href.length);
+        writeAscii(out, '">');
+        inlineRange(s, j + 1, k, env, out);
+        writeAscii(out, '</a>');
         plain = mm + 1;
         re.lastIndex = plain;
       } else {
@@ -505,103 +757,154 @@ function inline(s, env) {
       continue;
     }
     // An HTML special: & < > " '
-    if (plain < j) out += s.slice(plain, j);
-    out += ESCAPES[c];
+    if (plain < j) writeStrRange(out, s, plain, j);
+    writeAscii(out, ESCAPES[c]);
     plain = j + 1;
     re.lastIndex = plain;
   }
-  if (plain < s.length) out += s.slice(plain);
-  return out;
+  if (plain < end) writeStrRange(out, s, plain, end);
 }
 
 /**
- * `src` rendered: its HTML (each block on its own lines, a "\n" after the last), its
- * table of contents (every level 2 and 3 heading: level, id and its inline HTML) and
- * its excerpt (the first paragraph's inline HTML, or "").
+ * `src` rendered into the scratch arena: its HTML (each block on its own
+ * lines, a "\n" after the last) as a Range, its table of contents (every
+ * level 2 and 3 heading: level, id and its inline HTML as a Range) and its
+ * excerpt (the first paragraph's inline HTML as a Range, or an empty Range).
+ * Lines are found by offset, never split: the body is scanned once for its
+ * line starts, and every block works on (start, end) ranges. The excerpt and
+ * TOC html are sub-ranges of the page HTML itself, recorded as they are
+ * rendered, so they cost nothing extra.
  */
-/**
- * `src` rendered in one pass, straight to its HTML string (each block on its
- * own lines, a "\n" after the last), its table of contents (every level 2 and
- * 3 heading: level, id and its inline HTML) and its excerpt (the first
- * paragraph's inline HTML, or ""). No token objects, no block list: the same
- * blocks lex() + the old renderer produced, rendered as they are met, so the
- * output is identical while the lexer, the tokens and the blocks array -- and
- * the garbage they made -- are gone.
- */
-function renderMarkdown(src, env, slugCache) {
+function renderMarkdown(src, env, slugCache, scratch) {
   const ids = new Set();
   const toc = [];
   let excerpt = null;
-  let html = '';
-  const lines = src.split('\n');
-  const n = lines.length;
+  const starts = [0];
+  for (let i = 0; i < src.length; i++) if (src.charCodeAt(i) === 10) starts.push(i + 1);
+  const n = starts.length;
+  const lend = (k) => (k + 1 < n ? starts[k + 1] - 1 : src.length);
+  const htmlStart = scratch.n;
   let i = 0;
   while (i < n) {
-    const line = lines[i];
-    if (isBlank(line)) { i++; continue; }
-    const lang = fenceLang(line);
+    const s = starts[i];
+    const e = lend(i);
+    if (isBlankRange(src, s, e)) { i++; continue; }
+    const lang = fenceLangRange(src, s, e);
     if (lang !== null) {
-      let body = '';
-      let count = 0;
-      i++;
-      while (i < n && !isFenceClose(lines[i])) { if (count > 0) body += '\n'; body += lines[i++]; count++; }
-      i++;
-      const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
-      html += `<pre><code${cls}>${count === 0 ? '' : escapeHtml(body) + '\n'}</code></pre>\n`;
-      continue;
-    }
-    const heading = headingOf(line);
-    if (heading !== null) {
-      const id = uniqueSlug(slugify(heading.text, slugCache), ids);
-      const h = inline(heading.text, env);
-      html += `<h${heading.depth} id="${id}">${h}</h${heading.depth}>\n`;
-      if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html: h });
-      i++;
-      continue;
-    }
-    if (isHr(line)) { html += '<hr>\n'; i++; continue; }
-    if (line.charCodeAt(0) === 62) {
-      let body = '';
-      let count = 0;
-      while (i < n && lines[i].charCodeAt(0) === 62) {
-        const l = lines[i++];
-        const t = trimLine(l.charCodeAt(1) === 32 ? l.slice(2) : l.slice(1));
-        if (t !== '') { if (count > 0) body += '\n'; body += t; count++; }
+      writeAscii(scratch, '<pre><code');
+      if (lang !== '') {
+        const esc = escapeHtml(lang);
+        writeAscii(scratch, ' class="language-');
+        writeStrRange(scratch, esc, 0, esc.length);
+        writeAscii(scratch, '"');
       }
-      html += count === 0 ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inline(body, env)}</p>\n</blockquote>\n`;
+      writeAscii(scratch, '>');
+      let count = 0;
+      i++;
+      while (i < n && !isFenceCloseRange(src, starts[i], lend(i))) {
+        if (count > 0) writeByte(scratch, 10);
+        writeHtmlEscapedStrRange(scratch, src, starts[i], lend(i));
+        count++;
+        i++;
+      }
+      i++;
+      if (count > 0) writeByte(scratch, 10);
+      writeAscii(scratch, '</code></pre>\n');
       continue;
     }
-    const isBullet = (line.charCodeAt(0) === 45 || line.charCodeAt(0) === 42) && line.charCodeAt(1) === 32;
-    const ordered = !isBullet ? orderedOf(line) : null;
+    const heading = headingOfRange(src, s, e);
+    if (heading !== null) {
+      const text = src.slice(heading.a, heading.b);
+      const id = uniqueSlug(slugify(text, slugCache), ids);
+      writeAscii(scratch, `<h${heading.depth} id="`);
+      writeAscii(scratch, id);
+      writeAscii(scratch, '">');
+      const r0 = scratch.n;
+      inlineRange(src, heading.a, heading.b, env, scratch);
+      const r1 = scratch.n;
+      writeAscii(scratch, `</h${heading.depth}>\n`);
+      if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html: new Range(r0, r1 - r0) });
+      i++;
+      continue;
+    }
+    if (isHrRange(src, s, e)) { writeAscii(scratch, '<hr>\n'); i++; continue; }
+    if (src.charCodeAt(s) === 62) {
+      let body = '';
+      let count = 0;
+      while (i < n && src.charCodeAt(starts[i]) === 62) {
+        const ls = starts[i];
+        const le = lend(i);
+        let a = ls + 1;
+        if (a < le && src.charCodeAt(a) === 32) a++;
+        const t = trimRange(src, a, le);
+        const ts = src.slice(t[0], t[1]);
+        if (ts !== '') { if (count > 0) body += '\n'; body += ts; count++; }
+        i++;
+      }
+      if (count === 0) writeAscii(scratch, '<blockquote>\n</blockquote>\n');
+      else {
+        writeAscii(scratch, '<blockquote>\n<p>');
+        inlineRange(body, 0, body.length, env, scratch);
+        writeAscii(scratch, '</p>\n</blockquote>\n');
+      }
+      continue;
+    }
+    const isBullet = (src.charCodeAt(s) === 45 || src.charCodeAt(s) === 42) && src.charCodeAt(s + 1) === 32;
+    const ordered = !isBullet ? orderedOfRange(src, s, e) : null;
     if (isBullet || ordered !== null) {
       const isOrdered = ordered !== null;
       const start = isOrdered ? Number(ordered.num) : 1;
       const items = [];
       while (i < n) {
+        const ls = starts[i];
+        const le = lend(i);
         if (isOrdered) {
-          const m = orderedOf(lines[i]);
-          if (m !== null) { items.push(trimLine(m.rest)); i++; continue; }
-        } else if ((lines[i].charCodeAt(0) === 45 || lines[i].charCodeAt(0) === 42) && lines[i].charCodeAt(1) === 32) {
-          items.push(trimLine(lines[i].slice(2))); i++; continue;
+          const m = orderedOfRange(src, ls, le);
+          if (m !== null) {
+            const tr = trimRange(src, m.rest, le);
+            items.push(src.slice(tr[0], tr[1]));
+            i++;
+            continue;
+          }
+        } else if ((src.charCodeAt(ls) === 45 || src.charCodeAt(ls) === 42) && src.charCodeAt(ls + 1) === 32) {
+          const tr = trimRange(src, ls + 2, le);
+          items.push(src.slice(tr[0], tr[1]));
+          i++;
+          continue;
         }
-        if (isContinued(lines[i])) { items[items.length - 1] += '\n' + trimLine(lines[i]); i++; }
-        else break;
+        if (isContinuedRange(src, ls, le)) {
+          const tr = trimRange(src, ls, le);
+          items[items.length - 1] += '\n' + src.slice(tr[0], tr[1]);
+          i++;
+        } else break;
       }
       const tag = isOrdered ? 'ol' : 'ul';
-      const open = isOrdered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`;
-      let inner = '';
-      for (const item of items) inner += `<li>${inline(item, env)}</li>\n`;
-      html += `${open}\n${inner}</${tag}>\n`;
+      if (isOrdered && start !== 1) writeAscii(scratch, `<ol start="${start}">\n`);
+      else writeAscii(scratch, `<${tag}>\n`);
+      for (const item of items) {
+        writeAscii(scratch, '<li>');
+        inlineRange(item, 0, item.length, env, scratch);
+        writeAscii(scratch, '</li>\n');
+      }
+      writeAscii(scratch, `</${tag}>\n`);
       continue;
     }
-    let text = trimLine(line);
+    const t0 = trimRange(src, s, e);
+    let text = src.slice(t0[0], t0[1]);
     i++;
-    while (i < n && !endsParagraph(lines[i])) { text += '\n' + trimLine(lines[i]); i++; }
-    const h = inline(text, env);
-    if (excerpt === null) excerpt = h;
-    html += `<p>${h}</p>\n`;
+    while (i < n && !endsParagraphRange(src, starts[i], lend(i))) {
+      const tr = trimRange(src, starts[i], lend(i));
+      text += '\n' + src.slice(tr[0], tr[1]);
+      i++;
+    }
+    writeAscii(scratch, '<p>');
+    const r0 = scratch.n;
+    inlineRange(text, 0, text.length, env, scratch);
+    const r1 = scratch.n;
+    if (excerpt === null) excerpt = new Range(r0, r1 - r0);
+    writeAscii(scratch, '</p>\n');
   }
-  return { html, toc, excerpt: excerpt ?? '' };
+  return { html: new Range(htmlStart, scratch.n - htmlStart), toc, excerpt: excerpt ?? new Range(0, 0) };
 }
 
 // ---------------------------------------------------------------- templates
@@ -721,8 +1024,12 @@ function lookup(scope, path) {
   return v;
 }
 
-/** A value as text: a string itself, a number in JavaScript's digits, true or false, an array's items joined by ", ", else "". */
+/**
+ * A value as text: a string itself, a number in JavaScript's digits, true or false, an array's items joined by ", ", else "".
+ * A byte Range materializes to its string (only ever reached if a Range sits inside an array join, which the data model never does).
+ */
 function textOf(v) {
+  if (v instanceof Range) return Buffer.from(SCRATCH.b.subarray(v.s, v.s + v.l)).toString('utf8');
   if (typeof v === 'string') return v;
   if (typeof v === 'number') return String(v);
   if (typeof v === 'boolean') return v ? 'true' : 'false';
@@ -730,15 +1037,16 @@ function textOf(v) {
   return '';
 }
 
-/** Whether a value counts as true in an if: not undefined, null, false, "", 0 or an empty array. */
+/** Whether a value counts as true in an if: not undefined, null, false, "", 0 or an empty array (an empty byte Range is ""). */
 function truthy(v) {
+  if (v instanceof Range) return v.l > 0;
   if (Array.isArray(v)) return v.length > 0;
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
 // Names that are the same on every page render of one case (the site, the
 // tag list, the recent list). A for-loop whose body only reads these, its own
-// item and `loop` renders the same string for the same array, so it is
+// item and `loop` renders the same bytes for the same array, so it is
 // rendered once per array and reused -- the recent-posts and tag lists a
 // layout repeats on every page are the ones this saves.
 const CASE_CONSTANTS = new Set(['site', 'tags', 'recent']);
@@ -779,70 +1087,181 @@ function markMemoizable(nodes, bound) {
   }
 }
 
-/**
- * `n`'s body over the array `xs`, rendered into `acc.s`. One scope, one vars
- * object and one `loop` object for the whole loop, mutated per item: the
- * render is synchronous, so nothing can observe the previous item's values,
- * and the per-iteration object pair the old code made is gone.
- */
-function renderFor(n, xs, scope, ctx, depth, acc) {
-  const loop = { index: 0, first: false, last: false, length: xs.length };
-  const vars = { loop };
-  vars[n.name] = undefined;
-  const child = { vars, parent: scope };
-  for (let k = 0; k < xs.length; k++) {
-    vars[n.name] = xs[k];
-    loop.index = k + 1;
-    loop.first = k === 0;
-    loop.last = k === xs.length - 1;
-    renderNodes(n.body, child, ctx, depth, acc);
+// ---------------------------------------------------------------- the template VM
+
+// Opcodes. Every instruction is 5 slots: [op, a, b, c, d].
+// TEXT: a = const index of the text. VAR/RAW: a = const index of the path.
+// IF/IFNOT: a = const index of the path, b = pc to jump to when the branch is not taken.
+// JMP: a = target pc. FOR: a = const index of the path, b = const index of the
+// item name, c = pc just past ENDFOR, d = memo id (-1 when not memoizable).
+// ENDFOR: no operands. INCLUDE: a = const index of the template name.
+const OP = { TEXT: 0, VAR: 1, RAW: 2, IF: 3, IFNOT: 4, JMP: 5, FOR: 6, ENDFOR: 7, INCLUDE: 8 };
+
+/** A parsed template's nodes compiled to flat bytecode: { code, consts, memos }. */
+function compileTemplate(nodes) {
+  const code = [];
+  const consts = [];
+  const memos = [];
+  function emit(op, a, b, c, d) {
+    code.push(op, a, b, c, d);
+    return code.length - 5;
   }
+  function walk(ns) {
+    for (const n of ns) {
+      if (n.kind === 'text') {
+        // The text's JSON-escaped bytes, computed once per template at
+        // compile time instead of once per render: the VM just copies them.
+        const ci = consts.length;
+        consts.push(Buffer.from(JSON.stringify(n.text).slice(1, -1), 'utf8'));
+        emit(OP.TEXT, ci, 0, 0, 0);
+      } else if (n.kind === 'var' || n.kind === 'raw') {
+        const pi = consts.length;
+        consts.push(n.path);
+        emit(n.kind === 'var' ? OP.VAR : OP.RAW, pi, 0, 0, 0);
+      } else if (n.kind === 'if') {
+        const pi = consts.length;
+        consts.push(n.path);
+        const ifPc = emit(n.not ? OP.IFNOT : OP.IF, pi, 0, 0, 0);
+        walk(n.then);
+        if (n.else !== null) {
+          const jmpPc = emit(OP.JMP, 0, 0, 0, 0);
+          code[ifPc + 2] = code.length; // jumpFalse -> the else body
+          walk(n.else);
+          code[jmpPc + 1] = code.length; // jump -> past the else body
+        } else {
+          code[ifPc + 2] = code.length; // jumpFalse -> past the then body
+        }
+      } else if (n.kind === 'for') {
+        const pi = consts.length;
+        consts.push(n.path);
+        const ni = consts.length;
+        consts.push(n.name);
+        let memoId = -1;
+        if (n.memo === true) {
+          memoId = memos.length;
+          memos.push(new Map());
+        }
+        const forPc = emit(OP.FOR, pi, ni, 0, memoId);
+        walk(n.body);
+        emit(OP.ENDFOR, 0, 0, 0, 0);
+        code[forPc + 3] = code.length; // endPc = just past ENDFOR
+      } else if (n.kind === 'include') {
+        const ni = consts.length;
+        consts.push(n.name);
+        emit(OP.INCLUDE, ni, 0, 0, 0);
+      }
+    }
+  }
+  walk(nodes);
+  return { code, consts, memos };
+}
+
+/** A {{ }} value into the answer arena: HTML-escaped, then JSON-escaped. */
+function writeVar(out, v) {
+  if (v instanceof Range) {
+    copyHtmlJsonEscaped(out, SCRATCH.b, v.s, v.s + v.l);
+    return;
+  }
+  if (typeof v === 'number' || typeof v === 'boolean') {
+    writeJsonStr(out, String(v)); // digits, true, false hold no HTML special
+    return;
+  }
+  writeJsonStr(out, escapeHtml(textOf(v)));
+}
+
+/** A {{{ }}} value into the answer arena: raw, then JSON-escaped. */
+function writeRaw(out, v) {
+  if (v instanceof Range) {
+    copyJsonEscaped(out, SCRATCH.b, v.s, v.s + v.l);
+    return;
+  }
+  writeJsonStr(out, textOf(v));
 }
 
 /**
- * `nodes` rendered into `acc.s` (a string accumulator, faster than an array plus
- * a join for the many small chunks a page is made of) in `scope` ({ vars, parent }).
- * `ctx` holds the parsed templates, the HTML escape and the include depth.
+ * A compiled template executed into the answer arena `out` (every byte it
+ * writes is JSON-escaped, because the layout output is one JSON string value
+ * of the answer). `scope` is the scope chain ({ vars, parent }); `ctx` holds
+ * the compiled templates; `depth` is the include depth. A flat loop with a
+ * switch over integer opcodes: monomorphic, no object dispatch. A for-loop
+ * runs through one scope, one vars object and one `loop` object, mutated per
+ * item, as in v2. A memoizable loop renders once per array into the answer
+ * arena and the byte range is reused for the same array afterwards.
  */
-function renderNodes(nodes, scope, ctx, depth, acc) {
-  for (const n of nodes) {
-    switch (n.kind) {
-      case 'text':
-        acc.s += n.text;
-        break;
-      case 'var':
-        acc.s += escapeHtml(textOf(lookup(scope, n.path)));
-        break;
-      case 'raw':
-        acc.s += textOf(lookup(scope, n.path));
-        break;
-      case 'if': {
-        const v = truthy(lookup(scope, n.path));
-        const branch = v !== n.not ? n.then : n.else;
-        if (branch !== null) renderNodes(branch, scope, ctx, depth, acc);
-        break;
-      }
-      case 'for': {
-        const xs = lookup(scope, n.path);
-        if (!Array.isArray(xs)) break;
-        if (n.memo === true) {
-          const cache = n.cache ?? (n.cache = new Map());
-          const hit = cache.get(xs);
-          if (hit !== undefined) { acc.s += hit; break; }
-          const tmp = { s: '' };
-          renderFor(n, xs, scope, ctx, depth, tmp);
-          cache.set(xs, tmp.s);
-          acc.s += tmp.s;
-          break;
+function runVM(prog, scope, ctx, depth, out) {
+  const code = prog.code;
+  const consts = prog.consts;
+  let pc = 0;
+  const frames = [];
+  while (pc < code.length) {
+    const op = code[pc];
+    if (op === OP.TEXT) {
+      const c = consts[code[pc + 1]];
+      if (out.n + c.length > out.b.length) out.grow(c.length);
+      out.b.set(c, out.n);
+      out.n += c.length;
+      pc += 5;
+    } else if (op === OP.VAR) {
+      writeVar(out, lookup(scope, consts[code[pc + 1]]));
+      pc += 5;
+    } else if (op === OP.RAW) {
+      writeRaw(out, lookup(scope, consts[code[pc + 1]]));
+      pc += 5;
+    } else if (op === OP.IF) {
+      pc = truthy(lookup(scope, consts[code[pc + 1]])) ? pc + 5 : code[pc + 2];
+    } else if (op === OP.IFNOT) {
+      pc = truthy(lookup(scope, consts[code[pc + 1]])) ? code[pc + 2] : pc + 5;
+    } else if (op === OP.JMP) {
+      pc = code[pc + 1];
+    } else if (op === OP.FOR) {
+      const xs = lookup(scope, consts[code[pc + 1]]);
+      const memoId = code[pc + 4];
+      const endPc = code[pc + 3];
+      if (!Array.isArray(xs) || xs.length === 0) {
+        if (Array.isArray(xs) && memoId >= 0) prog.memos[memoId].set(xs, new Range(out.n, 0));
+        pc = endPc;
+      } else if (memoId >= 0) {
+        const hit = prog.memos[memoId].get(xs);
+        if (hit !== undefined) {
+          writeBytes(out, out.b, hit.s, hit.s + hit.l);
+          pc = endPc;
+        } else {
+          const loop = { index: 1, first: true, last: xs.length === 1, length: xs.length };
+          const vars = { loop };
+          vars[consts[code[pc + 2]]] = xs[0];
+          const frame = { endPc, xs, k: 0, name: consts[code[pc + 2]], memoId, startCursor: out.n, bodyPc: pc + 5, child: { vars, parent: scope }, loop, vars };
+          frames.push(frame);
+          scope = frame.child;
+          pc = pc + 5;
         }
-        renderFor(n, xs, scope, ctx, depth, acc);
-        break;
+      } else {
+        const loop = { index: 1, first: true, last: xs.length === 1, length: xs.length };
+        const vars = { loop };
+        vars[consts[code[pc + 2]]] = xs[0];
+        const frame = { endPc, xs, k: 0, name: consts[code[pc + 2]], memoId: -1, startCursor: out.n, bodyPc: pc + 5, child: { vars, parent: scope }, loop, vars };
+        frames.push(frame);
+        scope = frame.child;
+        pc = pc + 5;
       }
-      case 'include': {
-        const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) renderNodes(t, scope, ctx, depth + 1, acc);
-        break;
+    } else if (op === OP.ENDFOR) {
+      const fr = frames[frames.length - 1];
+      fr.k++;
+      if (fr.k < fr.xs.length) {
+        fr.vars[fr.name] = fr.xs[fr.k];
+        fr.loop.index = fr.k + 1;
+        fr.loop.first = false;
+        fr.loop.last = fr.k === fr.xs.length - 1;
+        pc = fr.bodyPc;
+      } else {
+        frames.pop();
+        scope = fr.child.parent;
+        if (fr.memoId >= 0) prog.memos[fr.memoId].set(fr.xs, new Range(fr.startCursor, out.n - fr.startCursor));
+        pc += 5;
       }
+    } else if (op === OP.INCLUDE) {
+      const t = ctx.templates.get(consts[code[pc + 1]]);
+      if (t !== undefined && depth < INCLUDE_DEPTH) runVM(t, scope, ctx, depth + 1, out);
+      pc += 5;
     }
   }
 }
@@ -878,7 +1297,7 @@ function linkOf(s, slugCache) {
   };
 }
 
-/** A post's card, as lists show it. */
+/** A post's card, as lists show it. The excerpt is a byte Range into the scratch arena. */
 function cardOf(s) {
   return {
     title: s.data.title,
@@ -892,14 +1311,35 @@ function cardOf(s) {
   };
 }
 
-/** One site's output tree: path -> text. */
+/** A page's record as templates read it. Content and TOC html are byte Ranges. */
+function pageOf(s) {
+  return {
+    ...s.card,
+    slug: s.slug,
+    content: s.html,
+    toc: s.toc,
+    newer: linkOf(s.newer ?? null),
+    older: linkOf(s.older ?? null),
+    is_post: s.post,
+  };
+}
+
+// The two arenas, reused across the cases of one process (each run() resets
+// their cursors). run() returns a view of OUT; the driver writes it out
+// before the next run() call, so reuse is safe.
+const SCRATCH = new Buf(1 << 24);
+const OUT = new Buf(1 << 24);
+
+/** One site's answer as JSON bytes: the output tree, emitted straight into the answer arena. */
 function build(input) {
+  SCRATCH.n = 0;
+  OUT.n = 0;
   const slugCache = new Map();
   const templates = new Map();
   const report = [];
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
     try {
-      templates.set(name, parseTemplate(name, input.templates[name]));
+      templates.set(name, compileTemplate(parseTemplate(name, input.templates[name])));
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
@@ -916,7 +1356,6 @@ function build(input) {
     report,
     posts: [],
     tags: [],
-    output: {},
   };
 
   // 1. Sources, in code-unit order of their paths; .md is a source, the rest static.
@@ -981,6 +1420,7 @@ function build(input) {
   }
 
   // 4. Each body's Markdown, its links resolved to the pages and static files they name.
+  // The HTML, excerpt and TOC html are byte Ranges into the scratch arena.
   {
     const staticPaths = new Set(b.statics.map((f) => f.path));
     for (const s of b.sources) {
@@ -999,7 +1439,7 @@ function build(input) {
           return target;
         },
       };
-      const md = renderMarkdown(s.body, env, slugCache);
+      const md = renderMarkdown(s.body, env, slugCache, SCRATCH);
       s.html = md.html;
       s.toc = md.toc;
       s.excerpt = md.excerpt;
@@ -1054,6 +1494,10 @@ function build(input) {
   }
 
   // 7. Every page through its layout, the index pages and the tag pages through theirs.
+  // Emitted straight into the answer arena as JSON: "path":"content" pairs, in
+  // v2's construction order. A layout's output is written by the VM directly
+  // into the answer arena, JSON-escaped as it goes, so no page HTML string
+  // and no output object graph are ever built.
   {
     const cards = new Map();
     for (const p of b.posts) {
@@ -1064,53 +1508,59 @@ function build(input) {
     const site = { title: b.input.site.title, base_url: b.base };
     const allTags = b.tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
     const recent = b.posts.slice(0, b.input.site.recent).map((p) => cards.get(p));
-    const ctx = { templates: b.templates, escape: escapeHtml };
-    const render = (name, vars) => {
-      const nodes = b.templates.get(name);
-      if (nodes === undefined) return null;
-      const acc = { s: '' };
-      renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0, acc);
-      return acc.s;
+    const ctx = { templates: b.templates };
+    const emitted = new Set();
+    let first = true;
+    const emitKey = (path) => {
+      if (!first) writeByte(OUT, 44); // ,
+      first = false;
+      writeByte(OUT, 34); // "
+      writeJsonStr(OUT, path);
+      writeByte(OUT, 34); // "
+      writeByte(OUT, 58); // :
+      writeByte(OUT, 34); // " (the value string opens; the VM or a writer closes it)
+      emitted.add(path);
     };
-    const pageOf = (s) => ({
-      ...s.card,
-      slug: s.slug,
-      content: s.html,
-      toc: s.toc,
-      newer: linkOf(s.newer ?? null, slugCache),
-      older: linkOf(s.older ?? null, slugCache),
-      is_post: s.post,
-    });
-    for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
+    const emitRendered = (path, name, vars) => {
+      const prog = b.templates.get(name);
+      if (prog === undefined) return;
+      emitKey(path);
+      runVM(prog, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0, OUT);
+      writeByte(OUT, 34); // " (the value string closes)
+    };
+    writeByte(OUT, 123); // {
+    for (const s of b.sources) emitRendered(`${s.outDir}/index.html`, s.layout, { page: pageOf(s) });
     const per = b.input.site.per_page;
     const pages = Math.max(1, Math.ceil(b.posts.length / per));
     const indexUrl = (k) => (k === 1 ? `${b.base}/` : `${b.base}/page/${k}/`);
     for (let k = 1; k <= pages; k++) {
-      const html = render('index', {
+      emitRendered(k === 1 ? 'index.html' : `page/${k}/index.html`, 'index', {
         posts: b.posts.slice((k - 1) * per, k * per).map((p) => cards.get(p)),
         pager: { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) },
       });
-      if (html !== null) b.output[k === 1 ? 'index.html' : `page/${k}/index.html`] = html;
     }
     for (const t of b.tags) {
-      const html = render('tag', { tag: { name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => cards.get(p)) } });
-      if (html !== null) b.output[`tags/${t.slug}/index.html`] = html;
+      emitRendered(`tags/${t.slug}/index.html`, 'tag', { tag: { name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => cards.get(p)) } });
     }
-    const tagsHtml = render('tags', {});
-    if (tagsHtml !== null) b.output['tags/index.html'] = tagsHtml;
+    emitRendered('tags/index.html', 'tags', {});
     for (const f of b.statics) {
-      if (Object.hasOwn(b.output, f.path)) b.report.push(`shadowed ${f.path}: a built page has its path`);
-      else b.output[f.path] = f.content;
+      if (emitted.has(f.path)) b.report.push(`shadowed ${f.path}: a built page has its path`);
+      else {
+        emitKey(f.path);
+        writeJsonStr(OUT, f.content);
+        writeByte(OUT, 34);
+      }
     }
-  }
 
-  // 8. The report: every refusal, draft, broken link and template that did not parse, sorted, then the counts.
-  {
+    // 8. The report: every refusal, draft, broken link and template that did not parse, sorted, then the counts.
     const lines = [...b.report, ...b.broken].sort(byCodeUnits);
-    const pages = b.sources.filter((s) => !s.post).length;
-    lines.push(`built ${pages} pages, ${b.posts.length} posts, ${b.tags.length} tags and ${b.statics.length} static files`);
-    b.output[REPORT_FILE] = `${lines.join('\n')}\n`;
+    const pageCount = b.sources.filter((s) => !s.post).length;
+    lines.push(`built ${pageCount} pages, ${b.posts.length} posts, ${b.tags.length} tags and ${b.statics.length} static files`);
+    emitKey(REPORT_FILE);
+    writeJsonStr(OUT, `${lines.join('\n')}\n`);
+    writeByte(OUT, 34);
+    writeByte(OUT, 125); // }
   }
 
-  return b.output;
+  return OUT.b.subarray(0, OUT.n);
 }
