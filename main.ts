@@ -6,31 +6,28 @@
 // cases' order. Outside a container MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR
 // stand in for /input and /output.
 //
-// One change from the baseline's driver: the answers are stringified and
-// written one case at a time, as each is produced, instead of holding the
-// whole answers array and stringifying 7.4 MB at once. The bytes written are
-// identical to JSON.stringify(answers) -- a JSON array is "[" + the cases'
-// stringified answers joined by "," + "]" -- and each case is still answered
-// alone, nothing carried from one case to the next. It is measurably faster
-// end to end (fresh-process practice set: ~947 ms vs ~1112 ms for the
-// hold-everything driver), because the peak live set stays one case instead
-// of the whole array plus its 7.4 MB string, so the garbage collector has far
-// less to do.
+// Contract change from v2: run() returns a Uint8Array holding the JSON bytes
+// of one case's answer object, not the object itself. The driver writes "[",
+// then each case's bytes separated by ",", then "]" via writeSync. The bytes
+// written are a JSON array whose values are the same answers v2 wrote (the
+// scorer reads /output/answers.json as JSON values, and v3 emits keys in the
+// same construction order v2 did), and each case is still answered alone,
+// nothing carried from one case to the next. The win: no JSON.stringify of a
+// 7.4 MB object graph, and the peak live set stays one case's bytes.
+//
+// V8 flags: --no-incremental-marking (the house baseline runs with it, and an
+// entry may tune V8's flags too) and --max-semi-space-size=64 (fewer
+// scavenges over the build's many short-lived objects), set before solve.js
+// is imported so all of its work runs under them.
 
 import { readFileSync, mkdirSync, openSync, writeSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 
-// V8's incremental marking off, set before solve.js is imported so all of its
-// work runs under it (the rules: the house baseline runs with
-// --no-incremental-marking, and an entry may tune V8's flags too). A larger
-// young generation (64 MB semi-spaces) is also set: the build allocates many
-// short-lived objects, and fewer scavenges are measurably faster end to end
-// (fresh-process practice set: ~961 ms vs ~990 ms without it).
 setFlagsFromString('--no-incremental-marking --max-semi-space-size=64');
 
-/** solve.js, imported by its URL (a .js module carries no types) and typed by its contract. */
-const { run } = (await import(new URL('./solve.js', import.meta.url).href)) as { run: (input: unknown) => unknown };
+/** solve.js, imported by its URL (a .js module carries no types) and typed by its contract: run returns the answer's JSON bytes. */
+const { run } = (await import(new URL('./solve.js', import.meta.url).href)) as { run: (input: unknown) => Uint8Array };
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
@@ -41,7 +38,7 @@ const fd = openSync(join(OUTPUT_DIR, 'answers.json'), 'w');
 writeSync(fd, '[');
 for (let k = 0; k < cases.length; k++) {
   if (k > 0) writeSync(fd, ',');
-  writeSync(fd, JSON.stringify(run(cases[k].input)));
+  writeSync(fd, run(cases[k].input));
 }
 writeSync(fd, ']');
 closeSync(fd);
